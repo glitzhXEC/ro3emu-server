@@ -48,10 +48,19 @@ public sealed partial class CharacterService
     /// handler creates (LC_DAL_Item._processStoragePack); the change handler returns while it does not exist. So when
     /// the first card goes into a socket and the client was sent no storagePack, 5009 goes out whole again.
     /// </summary>
-    private async Task SyncItemsAsync(GameSession session, Func<bool>? stillOwner = null)
+    private async Task SyncItemsAsync(GameSession session, Func<bool>? stillOwner = null, bool forceFull = false)
     {
+        // Build while the previous snapshot is still present: BuildItems uses it to retain
+        // already-known empty packs and card storage. Invalidate only after that projection.
         var now = BuildItems(session);
-        if (now.StoragePack != null && session.Synced.GetValueOrDefault(ItemsSync) is DBItemsInfo { StoragePack: null }) session.Synced.Remove(ItemsSync);
+        var before = session.Synced.GetValueOrDefault(ItemsSync) as DBItemsInfo;
+        // A newly introduced bag tab needs the full dataset initialization path.
+        // For example, the equipment bag may first appear when the player unequips
+        // their last worn-only item. A map addition alone can leave it invisible.
+        bool hasNewPack = before != null && now.PackInfo.Keys.Any(pack => !before.PackInfo.ContainsKey(pack));
+        bool hasNewStorage = before != null && now.StoragePack != null && before.StoragePack == null;
+        if (forceFull || hasNewPack || hasNewStorage)
+            session.Synced.Remove(ItemsSync);
         await SyncAsync(session, ItemsSync, now);
         if (stillOwner?.Invoke() == false) return;
         if (PruneEquipmentPlans(session))
@@ -97,7 +106,19 @@ public sealed partial class CharacterService
         var info = new DBItemsInfo { AutoDecomposeSetting = session.AutoDecompose.Clone() };
         var preferences = session.BagState.Info;
         info.QuickUseInfos.Add(preferences.QuickUseInfos);
-        info.ShortcutBarInfos.Add(preferences.ShortcutBarInfos);
+        // Keep wire-list positions stable: each index always corresponds to its slot.
+        // A sparse list shrinks on removal and is sent as a whole-list replacement;
+        // a fixed-size list lets AutoSync send optional itemGuid = 0 on the cleared slot.
+        // This is a wire projection only; persisted shortcut preferences remain sparse.
+        for (int slot = 0; slot < ShortcutSlotLimit; slot++)
+        {
+            var binding = preferences.ShortcutBarInfos.LastOrDefault(i => i.SlotIndex == slot);
+            info.ShortcutBarInfos.Add(new ShortcutBarInfo
+            {
+                SlotIndex = slot,
+                ItemGuid = binding?.ItemGuid ?? 0,
+            });
+        }
         info.MedicinesAutoUse = preferences.MedicinesAutoUse?.Clone();
         info.CurrentArrowID = preferences.CurrentArrowID;
         info.ItemCds = preferences.ItemCds?.Clone();

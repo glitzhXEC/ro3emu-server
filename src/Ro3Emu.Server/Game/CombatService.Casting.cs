@@ -83,8 +83,27 @@ public sealed partial class CombatService
             int group = (int)GameData.Int(row!.Value, "_iSkillID"), mode = (int)GameData.Int(row.Value, "_iMode");
             if (Math.Max(s.SkillCds.GetValueOrDefault(group), s.SkillModeCds.GetValueOrDefault((group, mode))) > Now) error = ErrorCodes.SkillCooldown;
             // Preserve the established cooldown refusal for a repeated cast, including during its action tail.
-            else if (s.SkillCast is { Cancelled: false } active && Now < active.StartMs + active.ChantMs + active.ActionMs
-                && GameData.Int(row.Value, "_bCancelCast") == 0) error = ErrorCodes.SkillBusy;
+            else if (s.SkillCast is { Cancelled: false } active
+                && (
+                    // Keep normal-attack key repeats from restarting a swing or cancelling a real skill.
+                    (owned == null && active.Operator == null
+                        && GameData.Int(row.Value, "_iIsNormalAtk") == 1
+                        && (GameData.Int(active.Row, "_iIsNormalAtk") != 1
+                            || (active.Request.SkillId == req.SkillId
+                                && active.Request.TargetId == req.TargetId
+                                && active.Request.IsExtraSkill == req.IsExtraSkill)))
+
+                    // A non-normal player skill may preempt a normal swing immediately.
+                    // Other skill-to-skill interruption keeps the existing _bCancelCast rule.
+                    || (Now < active.StartMs + active.ChantMs + active.ActionMs
+                        && GameData.Int(row.Value, "_bCancelCast") == 0
+                        && !(owned == null && active.Operator == null && !req.IsExtraSkill
+                            && GameData.Int(row.Value, "_iIsNormalAtk") != 1
+                            && GameData.Int(active.Row, "_iIsNormalAtk") == 1))
+                ))
+            {
+                error = ErrorCodes.SkillBusy;
+            }
             else error = ValidateTarget(s, row.Value, req, origin, owned == null ? WalkSlack(s) : 0);
         }
         var costs = row is { } value ? ResolveCosts(s, value) : new CastCosts();
@@ -109,6 +128,17 @@ public sealed partial class CombatService
         }
         if (lease?.Cancelled == true || !ReferenceEquals(s.Attachment, lease) ||
             s.SceneGeneration != scene || s.WorldScene != worldScene || s.SceneLoading) return;
+        // Suspend the existing PvE normal-attack intent while a real player skill runs.
+        // Keep the same enemy for a targeted skill, or for a ground/self-targeted skill.
+        // A skill explicitly aimed at another target does not resume the old enemy.
+        var resumeAttack = owned == null && !req.IsExtraSkill
+            && GameData.Int(row!.Value, "_iIsNormalAtk") != 1
+            && s.Attack is { } previousAttack
+            && (req.TargetId == 0 || req.TargetId == s.Role!.Id || req.TargetId == previousAttack.Target.Uid)
+            && CanHitMonster(s, previousAttack.Target)
+            && EffectiveSkillRow(s, previousAttack.SkillId) is { } previousRow
+            && GameData.Int(previousRow, "_iIsNormalAtk") == 1
+                ? previousAttack : null;
         await CancelCastAsync(s, SkillInterruptedInfo.Types.SkillInterruptType.Skill);
         eventAttacks.Remove(s);
         await PayCostsAsync(s, costs);
@@ -116,7 +146,10 @@ public sealed partial class CombatService
         await s.SendGameAsync(UseSkill, new CastSkillRsp { SessionId = id, IsAutoCast = req.IsAutoCast });
         var target = FindMonster(s.WorldScene, req.TargetId);
         var playerTarget = EventTarget(s, req.TargetId);
-        if (GameData.Int(row!.Value, "_iIfAutoAtk") == 2 && owned == null && target != null && CanHitMonster(s, target))
+        // Tick waits for SkillCast to clear before swinging, so preserving this intent
+        // resumes the normal attack only after the inserted skill has completed.
+        if (resumeAttack != null) s.Attack = resumeAttack;
+        else if (GameData.Int(row!.Value, "_iIfAutoAtk") == 2 && owned == null && target != null && CanHitMonster(s, target))
         {
             s.Attack = new AttackLoop { Target = target, SkillId = req.SkillId,
                 NextSwingMs = Now + SkillMs(s, row.Value) + Math.Max(0, GameData.Int(row.Value, "_iChantFix") + GameData.Int(row.Value, "_iChantVar")) + 1,
@@ -471,6 +504,30 @@ public sealed partial class CombatService
     {
         if (eventAttacks.TryGetValue(s, out var eventAttack)
             && MonsterService.Distance(eventAttack.StartX, eventAttack.StartZ, s.Position.X, s.Position.Z) > 1.5f) eventAttacks.Remove(s);
+        // The approach-stop packet may follow cast acceptance by only a few ms.
+        // Reanchor an existing normal-attack loop under the same bounded stop allowance
+        // as the cast below, before the ordinary movement cancellation checks run.
+        // Never create a loop here or rearm one already cancelled by real movement.
+        if (s.Attack is { } approachAttack
+            && s.SkillCast is { Cancelled: false, StartedWalking: true } approachCast
+            && approachCast.Operator == null
+            && GameData.Int(approachCast.Row, "_iIsNormalAtk") == 1
+            && approachAttack.SkillId == approachCast.Request.SkillId
+            && approachAttack.Target.Uid == approachCast.Request.TargetId
+            && !s.Walking && Now >= approachCast.StartMs && Now - approachCast.StartMs <= 300
+            && Distance(approachCast.Origin, s.Position) <= s.Speed / 100f * 0.75f + 0.5f)
+        {
+            approachCast.Origin = s.Position.Clone();
+            approachCast.StartedWalking = false;
+            s.Attack = new AttackLoop
+            {
+                Target = approachAttack.Target,
+                SkillId = approachAttack.SkillId,
+                NextSwingMs = approachAttack.NextSwingMs,
+                StartX = s.Position.X,
+                StartZ = s.Position.Z,
+            };
+        }
         if (s.Attack is { } a && MonsterService.Distance(a.StartX, a.StartZ, s.Position.X, s.Position.Z) > 0.1f) s.Attack = null;
         if (s.SkillCast is not { } cast || Distance(cast.Origin, s.Position) <= 0.1f || GameData.Int(cast.Row, "_bMovement") != 0) return;
         // The client casts on reaching range and stops 1 ms later (in-game 11.10): that first stop is the cast's real

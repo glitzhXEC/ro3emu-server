@@ -187,8 +187,11 @@ public sealed partial class CharacterService
         int result = !validType || req.OpType is < MedicineAutoUseOpType.Switch or > MedicineAutoUseOpType.Medicine
             || req.SetData == null || req.SetData.Condition is < 0 or > 100 || req.SetData.ItemEntrys.Count > 8
             ? ErrorCodes.Parameter : 0;
-        if (result == 0 && req.SetData!.ItemEntrys.Any(entry => entry <= 0 || data.Row("ItemConfig", entry) is not { } row
-            || GameData.Int(row, "_iIsUse") == 0)) result = ErrorCodes.ItemNoConfig;
+        // The client sends fixed-position medicine slots; entry 0 means an empty slot.
+        // Preserve those positions. Reject negative IDs and validate every non-empty slot.
+        if (result == 0 && req.SetData!.ItemEntrys.Any(entry => entry < 0
+            || (entry != 0 && (data.Row("ItemConfig", entry) is not { } row
+                || GameData.Int(row, "_iIsUse") == 0)))) result = ErrorCodes.ItemNoConfig;
         var nextInfo = session.BagState.Info.Clone();
         var saved = nextInfo.MedicinesAutoUse ?? new MedicinesAutoUseSet();
         if (result == 0)
@@ -294,11 +297,20 @@ public sealed partial class CharacterService
         {
             var next = session.BagState.Info.Clone();
             var list = next.ShortcutBarInfos;
-            foreach (var old in list.Where(i => i.SlotIndex == req.SlotIndex).ToList()) list.Remove(old);
-            if (req.ItemGuid != 0) list.Add(new ShortcutBarInfo { SlotIndex = req.SlotIndex, ItemGuid = req.ItemGuid });
+            // Shortcut identity is the exact item GUID, not its template entry.
+            // Different stacks (including bound/unbound or locked/unlocked items) remain distinct.
+            // Move the same GUID to the destination; GUID 0 clears only that destination.
+            // These edits affect shortcut bindings only, never inventory quantities or flags.
+            foreach (var old in list.Where(i => i.SlotIndex == req.SlotIndex
+                || (req.ItemGuid != 0 && i.ItemGuid == req.ItemGuid)).ToList())
+                list.Remove(old);
+            if (req.ItemGuid != 0)
+                list.Add(new ShortcutBarInfo { SlotIndex = req.SlotIndex, ItemGuid = req.ItemGuid });
             await CommitBagAsync(session, "bag-setting", next);
         }
         await session.SendGameAsync(ShortcutBarSave, new ShortcutBarSaveRes { Result = result });
+        // BuildItems projects a stable slot array, so the normal diff sends explicit
+        // itemGuid = 0 increments for cleared slots instead of omitting removed entries.
         if (result == 0) await SyncItemsAsync(session);
     }
 
